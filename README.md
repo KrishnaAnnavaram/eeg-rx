@@ -113,7 +113,7 @@ eeg-rx gives each of these questions its own component. Each component has unit 
 | Classifiers | Logistic regression (default), RBF SVM, small MLP |
 | Offline mode | Everything. Synthetic EEG replaces the patient data |
 | Safety | Subject-wise folds with a leakage check, a disclaimer on each report and prediction |
-| Tests | **26** unit tests pass (`pytest`). 1 test skips without MNE |
+| Tests | **26** unit tests pass and **1** skips in CI (`pytest`). The skipped test needs MNE |
 
 ```mermaid
 flowchart LR
@@ -479,7 +479,7 @@ eeg-rx uses no credentials. Keep local values in `.env`. Git ignores this file.
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests | **26 passed, 1 skipped** (MNE not installed). The same count is expected in CI | `pytest -q` |
+| Unit tests | **26 passed, 1 skipped** in CI (MNE is not installed) | `pytest -q` |
 | Synthetic, effect 0.2, `logreg` | AUROC 0.843 [0.662, 0.977], balanced accuracy 0.792, permutation p = 0.020 (50 shuffles) | `eeg-rx evaluate --features-file ...` |
 | Synthetic, effect 0.2, `svm` | AUROC 0.806 [0.620, 0.949], balanced accuracy 0.639 | `... --classifier svm --permutations 0` |
 | Synthetic, effect 0.2, `logreg` with `l1` selector | AUROC 0.870 [0.718, 0.972], balanced accuracy 0.750 | `... --selector l1 --permutations 0` |
