@@ -73,6 +73,7 @@ This README is the **one location that explains all of eeg-rx**. It gives these 
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one subject](#42-the-life-cycle-of-one-subject)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 📥 [The loaders](#5-the-loaders)
 6. 🧹 [The preprocessing](#6-the-preprocessing)
 7. 🔵 [The pattern histogram features](#7-the-pattern-histogram-features)
@@ -141,13 +142,56 @@ flowchart LR
 | Synthetic EEG | `src/eeg_rx/synthetic.py` | Subjects with fingerprints, an adjustable label effect and blinks |
 | CLI | `src/eeg_rx/cli.py` | The `eeg-rx` command with 6 subcommands |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    CLI["cli.py<br/>synth, features, evaluate,<br/>leakage-demo, train, predict"]
+    CFG["config.py<br/>Settings.from_env, merge"]
+    subgraph DATAIN["Data in"]
+        IO["io.py<br/>load_mat_folder, load_edf_manifest,<br/>save_mat_folder, Recording"]
+        SYN["synthetic.py<br/>SynthSpec, generate"]
+        PRE["preprocess.py<br/>preprocess, Epochs"]
+    end
+    subgraph FEAT["features/"]
+        EXT["__init__.py<br/>extract, FeatureSet"]
+        LBP["lbp.py<br/>lbp_features"]
+        SPEC["spectral.py<br/>bandpower_features"]
+    end
+    subgraph LEARN["Learn and report"]
+        MOD["model.py<br/>make_pipeline, param_grid"]
+        EVA["evaluate.py<br/>nested_cv, evaluate,<br/>permutation_test, leaky_epoch_cv"]
+        TRN["train.py<br/>fit_final, save, load,<br/>predict_recording"]
+        REP["report.py<br/>write, model_card"]
+    end
+
+    CLI --> CFG
+    CLI --> IO
+    CLI --> SYN
+    CLI --> PRE
+    CLI --> EXT
+    CLI --> EVA
+    CLI --> TRN
+    CLI --> REP
+    SYN --> IO
+    PRE --> IO
+    EXT --> LBP
+    EXT --> SPEC
+    EXT --> PRE
+    EVA --> MOD
+    TRN --> MOD
+    TRN --> PRE
+    TRN --> EXT
+    TRN --> REP
+```
+
 ### 2.2 System context
 
 ```mermaid
 flowchart TB
     R["Researcher"] --> CLI["eeg-rx CLI"]
     CLI --> MAT["data/SSRI/*.mat (local, never committed)"]
-    CLI --> EDF["EDF files through MNE (optional)"]
+    R -.-> EDF["EDF files through MNE (optional):<br/>load_edf_manifest from Python, no CLI command"]
     CLI --> SYN["Synthetic EEG generator"]
     CLI --> REP["out/evaluation.json and evaluation.md"]
     CLI --> MOD["Model folder: model.joblib, model.json, MODEL_CARD.md"]
@@ -178,6 +222,21 @@ eeg-rx/
 ### 3.1 No subject is in two folds
 The outer loop uses `StratifiedGroupKFold` with the subject ID as the group, or leave one subject out. `check_no_subject_overlap` runs for each outer fold and raises `LeakageError` on an overlap.
 
+```mermaid
+flowchart LR
+    FS[/"FeatureSet: X, labels,<br/>subject ID of each epoch"/] --> OUT["outer_splitter: StratifiedGroupKFold<br/>or LeaveOneGroupOut, groups = subjects"]
+    OUT --> TR["Training subjects"]
+    OUT --> TE["Test subjects"]
+    TR --> CHK{"check_no_subject_overlap:<br/>a subject on both sides?"}
+    TE --> CHK
+    CHK -- "yes" --> ERR[/"LeakageError"/]
+    CHK -- "no" --> INNER["Inner GridSearchCV:<br/>StratifiedGroupKFold on<br/>training subjects only"]
+    INNER --> FIT["Fit variance filter, scaler,<br/>selector, classifier"]
+    FIT --> PRED["predict_proba on<br/>test subject epochs"]
+    TE --> PRED
+    PRED --> P[/"Out-of-fold epoch probabilities"/]
+```
+
 ### 3.2 Selection happens inside the folds
 Scaling and feature selection are steps of a scikit-learn `Pipeline`. The inner `GridSearchCV` selects the feature count on the training subjects only. The test subjects of a fold never touch a fit.
 
@@ -203,11 +262,17 @@ The loaders count the subjects and the samples from the files. The sampling rate
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    L["Load recordings with subject IDs and labels"] --> P["Band-pass 0.5-45 Hz, average reference"]
+flowchart TD
+    SRC{"Data source"} -- "--data-dir" --> MAT[/"SSRI_R_n.mat and SSRI_NR_n.mat"/]
+    SRC -- "--synthetic" --> SYN["synthetic.generate"]
+    SRC -- "--features-file" --> NPZ[("Saved .npz FeatureSet")]
+    MAT --> L["Load recordings with subject IDs and labels"]
+    SYN --> L
+    L --> P["Band-pass 0.5-45 Hz, average reference"]
     P --> E["15 s epochs, reject peak-to-peak > 300 uV"]
     E --> F["799 features for each epoch"]
     F --> O["Outer fold: training subjects / test subjects"]
+    NPZ --> O
     O --> I["Inner GridSearchCV on training subjects: feature count"]
     I --> M["Fit scaler, selector, classifier on training subjects"]
     M --> T["Epoch probabilities of test subjects"]
@@ -215,11 +280,45 @@ flowchart TB
     A --> X["AUROC, balanced accuracy, sensitivity, specificity, PPV, NPV, MCC, Brier"]
     X --> B["Bootstrap intervals over subjects"]
     X --> PT["Permutation test: shuffle subject labels, repeat all"]
-    B --> R["evaluation.json and evaluation.md"]
+    B --> R[/"evaluation.json and evaluation.md"/]
     PT --> R
+    R --> HUMAN{{"HUMAN<br/>researcher reads the intervals and p.<br/>A clinician makes each treatment decision"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one subject
+
+```mermaid
+stateDiagram-v2
+    state "File on disk or synthetic subject" as Source
+    state "Validated Recording" as Recording
+    state "Filtered and re-referenced" as Filtered
+    state "Epochs" as Epochs
+    state "Kept epochs" as Kept
+    state "No epoch left, skipped" as Skipped
+    state "Feature rows, 799 each" as Features
+    state "In the test fold" as TestFold
+    state "Epoch probabilities" as EpochP
+    state "Subject score" as Score
+    state "Counted in the metrics" as Scored
+    [*] --> Source
+    Source --> DataError: wrong label, shape, length or NaN
+    Source --> Recording: Recording.validate
+    Recording --> Filtered: bandpass, average_reference
+    Filtered --> Epochs: epoch, 15 s, incomplete end dropped
+    Epochs --> Kept: peak-to-peak 300 uV or less
+    Epochs --> Skipped: all epochs rejected
+    Kept --> Features: extract
+    Features --> TestFold: outer_splitter puts all epochs in one fold
+    TestFold --> EpochP: model fit on the other subjects
+    EpochP --> Score: mean epoch probability
+    Score --> Scored: binary_metrics at threshold 0.5
+    DataError --> [*]
+    Skipped --> [*]
+    Scored --> [*]
+```
 
 1. The loader reads the file and gives the subject an ID and a label.
 2. The preprocessing filters the recording and cuts it into 15 s epochs.
@@ -230,11 +329,62 @@ flowchart TB
 7. The mean of these probabilities is the subject score.
 8. The metrics compare the subject score with the subject label.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor R as Researcher
+    participant CLI as eeg-rx CLI
+    participant CFG as config.Settings
+    participant IO as io.py
+    participant PRE as preprocess.py
+    participant FE as features
+    participant EV as evaluate.py
+    participant REP as report.py
+    participant FS as out/ folder
+
+    R->>CLI: eeg-rx evaluate --data-dir data/SSRI
+    CLI->>CFG: from_env, then merge the CLI flags
+    CFG-->>CLI: validated Settings
+    CLI->>IO: load_mat_folder(data_dir, sfreq)
+    IO-->>CLI: list of Recording
+    CLI->>PRE: preprocess(recordings, epoch_seconds, l_freq, h_freq, reject_uv)
+    PRE-->>CLI: Epochs with subject IDs
+    CLI->>FE: extract(epochs, features)
+    FE-->>CLI: FeatureSet
+    CLI->>EV: evaluate(FeatureSet, settings)
+    EV->>EV: nested_cv, binary_metrics, bootstrap_ci
+    EV->>EV: permutation_test, nested_cv for each shuffle
+    EV-->>CLI: evaluation dict
+    CLI->>REP: write(result, out_dir, synthetic)
+    REP->>FS: evaluation.json and evaluation.md
+    CLI-->>R: report text and the two paths
+```
+
 ---
 
 ## 5. The loaders
 
 **Purpose.** Read recordings and keep the subject ID and the label with each one.
+
+```mermaid
+flowchart TD
+    DIR[/"data_dir"/] --> EX{"Folder exists?"}
+    EX -- "no" --> FNF[/"FileNotFoundError"/]
+    EX -- "yes" --> LIST["For each sorted file named<br/>SSRI_R_n.mat or SSRI_NR_n.mat,<br/>other files ignored"]
+    LIST --> VAR{"Variable EEG present?"}
+    VAR -- "no" --> DE1[/"DataError"/]
+    VAR -- "yes" --> SH{"Shape is samples x 19?"}
+    SH -- "yes" --> TP["Transpose to 19 x samples"]
+    SH -- "no" --> ID
+    TP --> ID["ID R01, NR03 and so on,<br/>label 1 for R, 0 for NR"]
+    ID --> VAL{"Recording.validate:<br/>label 0 or 1, 19 channels,<br/>1 s or more, finite values"}
+    VAL -- "fails" --> DE2[/"DataError"/]
+    VAL -- "passes" --> ANY{"Any matching file?"}
+    ANY -- "no" --> DE3[/"DataError"/]
+    ANY -- "yes" --> OUT[/"List of Recording"/]
+```
 
 | Input | Output |
 |---|---|
@@ -252,6 +402,7 @@ flowchart TB
 - A recording must have 19 channels, at least 1 s of signal and only finite values.
 - A label must be 0 or 1.
 - A folder with no matching file gives `DataError`.
+- The CLI reads only the `.mat` folder. No CLI command reads an EDF manifest. To use EDF files, call `load_edf_manifest` from Python (extra `mne`).
 
 ---
 
@@ -259,11 +410,33 @@ flowchart TB
 
 **Purpose.** Make clean, equal-length epochs.
 
+```mermaid
+flowchart TD
+    IN[/"List of Recording"/] --> SF{"One sampling rate<br/>for all recordings?"}
+    SF -- "no" --> VE1[/"ValueError"/]
+    SF -- "yes" --> BP["bandpass: Butterworth order 4,<br/>sosfiltfilt, zero phase"]
+    BP --> LF{"line_freq given?"}
+    LF -- "yes" --> NO["notch: iirnotch, Q 30"]
+    LF -- "no" --> AR["average_reference:<br/>subtract the channel mean"]
+    NO --> AR
+    AR --> EP["epoch: non-overlapping<br/>15 s parts, drop the end"]
+    EP --> RJ{"reject_uv above 0?"}
+    RJ -- "yes" --> PTP["Remove epochs with a channel<br/>peak-to-peak above reject_uv,<br/>count them for each subject"]
+    RJ -- "no" --> LEFT
+    PTP --> LEFT{"Epochs left<br/>for this subject?"}
+    LEFT -- "no" --> SKIP["Skip the subject"]
+    LEFT -- "yes" --> ADD["Add the epochs with<br/>subject ID and label"]
+    ADD --> ANY{"Any epoch<br/>for any subject?"}
+    SKIP --> ANY
+    ANY -- "no" --> VE2[/"ValueError: no epoch survived"/]
+    ANY -- "yes" --> OUT[/"Epochs: data, subjects,<br/>labels, sfreq, rejected"/]
+```
+
 **Procedure**
 
 1. Check that all recordings have one sampling rate.
 2. Apply a 4th-order Butterworth band-pass from 0.5 Hz to 45 Hz with zero phase.
-3. If a line frequency is given, apply a notch filter.
+3. If a line frequency is given, apply a notch filter. Only the Python argument `line_freq` gives it. No setting or CLI flag sets it.
 4. Subtract the mean of all channels from each channel (average reference).
 5. Cut non-overlapping epochs of 15 s. Drop the incomplete end.
 6. Remove each epoch in which a channel has a peak-to-peak value above 300 µV. Count the removed epochs for each subject.
@@ -273,6 +446,20 @@ flowchart TB
 ## 7. The pattern histogram features
 
 **Purpose.** Describe the local shape of each channel with 32 pattern codes.
+
+```mermaid
+flowchart LR
+    CH[/"One channel of one epoch"/] --> WIN["sliding_window_view:<br/>25 samples, step 1"]
+    WIN --> MAT["Reshape to 5x5,<br/>column j = samples 5j to 5j+4"]
+    MAT --> STD["Column standard deviations,<br/>ddof 1"]
+    STD --> DIFF["diff = highest-deviation column<br/>minus second-highest column"]
+    STD --> THR["threshold = deviations / 2^0.25"]
+    DIFF --> BIT["Bit k = 1 if diff k ≥ threshold k,<br/>element-wise"]
+    THR --> BIT
+    BIT --> CODE["Code = sum of bit k × 2^k,<br/>0 to 31"]
+    CODE --> HIST["bincount, 32 fixed bins,<br/>divide by the window count"]
+    HIST --> OUT[/"32 features for each channel,<br/>19 × 32 = 608"/]
+```
 
 **Procedure** (for each position of a 25-sample window)
 
@@ -294,6 +481,18 @@ flowchart TB
 
 ## 8. The spectral features
 
+```mermaid
+flowchart LR
+    EP[/"One epoch:<br/>19 channels × samples"/] --> W["welch: 2 s segments"]
+    W --> BP["band_powers: sum the PSD in<br/>delta, theta, alpha, beta, gamma"]
+    BP --> LOG["log10 band power<br/>19 × 5 = 95"]
+    BP --> REL["Band power / sum of the<br/>5 bands of the channel<br/>19 × 5 = 95"]
+    BP --> ASY["ln alpha F4 − ln alpha F3<br/>1 value"]
+    LOG --> OUT[/"191 spectral features"/]
+    REL --> OUT
+    ASY --> OUT
+```
+
 | Feature | Count | Definition |
 |---|---|---|
 | Log band power | 19 × 5 | `log10` of the Welch power (2 s segments) in delta 1–4, theta 4–8, alpha 8–13, beta 13–30, gamma 30–45 Hz |
@@ -305,6 +504,25 @@ These features are the baseline. A pattern-histogram result is useful only if it
 ---
 
 ## 9. The model pipelines
+
+```mermaid
+flowchart LR
+    X[/"Feature rows of<br/>the training subjects"/] --> V["variance:<br/>VarianceThreshold 0"]
+    V --> SC["scale:<br/>StandardScaler"]
+    SC --> SEL{"selector"}
+    SEL -- "anova" --> AN["SelectKBest f_classif,<br/>grid select__k"]
+    SEL -- "l1" --> L1["SelectFromModel L1 logistic,<br/>grid select__max_features"]
+    SEL -- "none" --> PT["passthrough, no grid"]
+    AN --> CLF{"classifier"}
+    L1 --> CLF
+    PT --> CLF
+    CLF -- "logreg" --> LR["LogisticRegression<br/>C 0.1, balanced"]
+    CLF -- "svm" --> SVM["RBF SVC in<br/>CalibratedClassifierCV, sigmoid, cv 3"]
+    CLF -- "mlp" --> MLP["MLPClassifier 32"]
+    LR --> P[/"Epoch probability<br/>predict_proba"/]
+    SVM --> P
+    MLP --> P
+```
 
 | Step | Default | Options |
 |---|---|---|
@@ -326,6 +544,24 @@ The inner score is the epoch-level AUROC.
 ## 10. The nested evaluation and the metrics
 
 **Purpose.** Give a subject-level estimate that no test subject influenced.
+
+```mermaid
+flowchart TD
+    FS[/"FeatureSet"/] --> NCV["nested_cv: one out-of-fold<br/>probability for each epoch"]
+    NCV --> SUB["Subject score = mean epoch probability,<br/>sorted subject IDs"]
+    SUB --> BM["binary_metrics at threshold 0.5:<br/>AUROC, balanced accuracy, sensitivity,<br/>specificity, PPV, NPV, MCC, Brier"]
+    SUB --> CI["bootstrap_ci: 2,000 stratified<br/>samples over subjects,<br/>AUROC and balanced accuracy"]
+    BM --> NP{"permutations above 0?"}
+    NP -- "no" --> OUT[/"evaluation dict"/]
+    NP -- "yes" --> SH["Shuffle the labels between subjects,<br/>rng seed + 1"]
+    SH --> NCV2["nested_cv with the shuffled labels"]
+    NCV2 --> NULL["fast_auroc of the null subject scores"]
+    NULL --> MORE{"More shuffles?"}
+    MORE -- "yes" --> SH
+    MORE -- "no" --> PV["p = 1 + count of null AUROC ≥ real,<br/>divided by 1 + permutations"]
+    PV --> OUT
+    CI --> OUT
+```
 
 **Procedure**
 
@@ -355,6 +591,23 @@ The inner score is the epoch-level AUROC.
 
 `eeg-rx leakage-demo` runs two protocols on the same features:
 
+```mermaid
+flowchart TD
+    FS[/"Same FeatureSet"/] --> W1
+    FS --> C1
+    subgraph WRONG["leaky_epoch_cv: the WRONG protocol"]
+        W1["SelectKBest f_classif, k 32,<br/>fit on ALL epochs"] --> W2["StratifiedKFold 10 over epochs:<br/>epochs of one subject in train and test"]
+        W2 --> W3["Pipeline with selector none,<br/>clone for each fold"]
+        W3 --> W4[/"Mean epoch accuracy"/]
+    end
+    subgraph RIGHT["nested_cv: the eeg-rx protocol"]
+        C1["Subject-wise outer folds,<br/>selection inside the folds"] --> C2["Subject scores"]
+        C2 --> C3[/"binary_metrics: balanced accuracy, AUROC"/]
+    end
+    W4 --> PR[/"Both numbers printed with the label effect"/]
+    C3 --> PR
+```
+
 | Protocol | Feature selection | Folds | Unit |
 |---|---|---|---|
 | WRONG (the prototype protocol) | ANOVA top 32 on all epochs | 10 stratified epoch folds | Epoch accuracy |
@@ -365,6 +618,34 @@ The synthetic subjects have fingerprints: channel gains and an alpha frequency o
 ---
 
 ## 12. Training, prediction and the model card
+
+```mermaid
+flowchart TD
+    FS[/"FeatureSet of all subjects"/] --> WE{"--with-evaluation?"}
+    WE -- "yes" --> EV["evaluate with n_perm 0"]
+    WE -- "no" --> FF
+    EV --> FF["fit_final: GridSearchCV with subject<br/>folds on all subjects, refit best"]
+    FF --> SV["save"]
+    SV --> J[("model.joblib")]
+    SV --> M[("model.json: settings, best_params,<br/>feature_names, counts")]
+    SV --> C[("MODEL_CARD.md: model_card<br/>with or without the evaluation")]
+```
+
+```mermaid
+flowchart TD
+    REC[/"One .mat recording"/] --> LD["load: model.joblib and model.json"]
+    LD --> RD["Read EEG, transpose if needed,<br/>Recording.validate"]
+    RD --> PRE["preprocess with the saved settings"]
+    PRE --> EXT["extract with the saved feature kinds"]
+    EXT --> NM{"Feature names equal<br/>to the model?"}
+    NM -- "no" --> VE[/"ValueError, CLI prints error: and exits 2"/]
+    NM -- "yes" --> PP["model.predict_proba on each epoch"]
+    PP --> OUT[/"JSON: responder_probability = mean,<br/>epochs used and rejected,<br/>probability range, disclaimer"/]
+    OUT --> HUMAN{{"HUMAN<br/>research use only,<br/>a clinician makes each treatment decision"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
+```
 
 **Procedure**
 
@@ -440,6 +721,25 @@ eeg-rx evaluate --features-file out/features.npz --outer-folds 0 --permutations 
 eeg-rx evaluate --features-file out/features.npz --classifier svm --out out/eval_svm
 ```
 
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> SYN["eeg-rx synth"]
+    SYN --> MATS[("data/synthetic/<br/>SSRI_R_n.mat, SSRI_NR_n.mat")]
+    REAL[("data/SSRI/*.mat")] --> FEA
+    MATS --> FEA["eeg-rx features"]
+    INS -- "--synthetic" --> FEA
+    FEA --> NPZ[("out/*.npz")]
+    NPZ --> EVA["eeg-rx evaluate"]
+    NPZ --> LEAK["eeg-rx leakage-demo"]
+    EVA --> REP[("out/eval/<br/>evaluation.json, evaluation.md")]
+    MATS --> TRN["eeg-rx train"]
+    TRN --> MOD[("models/name/<br/>model.joblib, model.json, MODEL_CARD.md")]
+    MOD --> PRD["eeg-rx predict"]
+    MATS --> PRD
+```
+
 ### 14.4 Environment variables
 
 | Variable | Used by | Meaning |
@@ -459,6 +759,17 @@ eeg-rx evaluate --features-file out/features.npz --classifier svm --out out/eval
 | `EEG_RX_PERMUTATIONS` | Evaluation | Default 50. 0 turns the test off |
 
 eeg-rx uses no credentials. Keep local values in `.env`. Git ignores this file.
+
+```mermaid
+flowchart LR
+    DEF[/"Settings defaults"/] --> FE["Settings.from_env:<br/>read EEG_RX_* variables"]
+    ENV[/"Process environment"/] --> FE
+    FE --> MG["merge: CLI flags that are set<br/>replace the values"]
+    FLAGS[/"CLI flags"/] --> MG
+    MG --> VAL{"validate: epoch_seconds and sfreq above 0,<br/>0 ≤ l_freq below h_freq below sfreq/2,<br/>outer_folds 0 or 2+, inner_folds 2+"}
+    VAL -- "yes" --> OK[/"Settings for the command"/]
+    VAL -- "no" --> ERR[/"ValueError: the CLI prints<br/>error: and returns 2"/]
+```
 
 ---
 
